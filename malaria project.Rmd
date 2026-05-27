@@ -1,0 +1,608 @@
+---
+title: "Malaria Risk Factor Analysis"
+author: "Ziporah Sandimu"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+pacman::p_load(dplyr,ggplot2, here, purrr, janitor, gtsummary, flextable,stringr,tidyr, lubridate, psych, forcats, epiR, labelled, lubridate, plotly, scales, hms, mice, e1071, caret, patchwork,stringr, rcompanion, car)
+```
+
+
+```{r}
+set.seed(123)
+n <- 1000
+
+# ---- base variables ----
+age <- sample(0:59, n, replace = TRUE)
+sex <- sample(c("Male", "Female", "FEMALE", "male ", NA), n, replace = TRUE)
+
+fever <- rbinom(n, 1, 0.4)
+headache <- rbinom(n, 1, 0.5)
+vomiting <- rbinom(n, 1, 0.2)
+fatigue <- rbinom(n, 1, 0.4)
+
+bednet <- rbinom(n, 1, 0.6)
+stagnant_water <- rbinom(n, 1, 0.3)
+sprayed_house <- rbinom(n, 1, 0.5)
+
+wealth <- sample(c("Poor", "Middle", "Rich", "rich ", "MID", NA),
+                 n, replace = TRUE)
+
+residence <- sample(c("Urban", "Rural", "urban ", "RURAL", NA),
+                    n, replace = TRUE)
+
+temperature <- rnorm(n, mean = 37.2, sd = 1.1)
+distance_health_facility <- rnorm(n, mean = 5, sd = 2)
+
+pregnant <- ifelse(sex == "Female", rbinom(n, 1, 0.1), 0)
+under5 <- ifelse(age < 5, 1, 0)
+
+recent_travel <- rbinom(n, 1, 0.25)
+previous_malaria <- rbinom(n, 1, 0.3)
+
+# ---- introduce missingness ----
+age[sample(1:n, 50)] <- NA
+temperature[sample(1:n, 40)] <- NA
+distance_health_facility[sample(1:n, 60)] <- NA
+
+# ---- inject outliers ----
+temperature[sample(1:n, 10)] <- c(42, 45, 50, 60, 100, rep(41, 4))
+age[sample(1:n, 5)] <- c(120, 200, -5, 999, 88)
+
+# ---- noisy sex categories (force inconsistency) ----
+sex[sample(1:n, 20)] <- c("F", "M", "female", "MALE", "unknown")
+
+# ---- logistic model (same logic but messy inputs allowed) ----
+logit_p <- -3 +
+  0.04 * ifelse(is.na(age), median(age, na.rm = TRUE), age) +
+  1.1 * fever +
+  0.8 * headache +
+  0.6 * vomiting +
+  0.5 * fatigue +
+  -1.2 * bednet +
+  0.9 * stagnant_water +
+  -0.7 * sprayed_house +
+  0.15 * ifelse(is.na(distance_health_facility), 5, distance_health_facility) +
+  1.0 * pregnant +
+  0.7 * under5 +
+  0.6 * recent_travel +
+  0.5 * previous_malaria +
+  ifelse(wealth %in% c("Poor","poor","POOR"), 0.9,
+         ifelse(wealth %in% c("Middle","MID","middle"), 0.4, 0)) +
+  ifelse(residence %in% c("Rural","RURAL","rural"), 0.8, 0)
+
+prob_malaria <- 1 / (1 + exp(-logit_p))
+malaria <- rbinom(n, 1, prob_malaria)
+
+# ---- FINAL messy dataset ----
+malaria_data_dirty <- data.frame(
+  age,
+  sex,
+  fever = fever,                  # intentionally NOT factor
+  headache = headache,
+  vomiting = vomiting,
+  fatigue = fatigue,
+  bednet = bednet,
+  stagnant_water = stagnant_water,
+  sprayed_house = sprayed_house,
+  wealth,
+  residence,
+  temperature,
+  distance_health_facility,
+  pregnant,
+  under5,
+  recent_travel,
+  previous_malaria,
+  malaria = malaria
+)
+
+# ---- introduce duplicates ----
+malaria_data_dirty <- rbind(
+  malaria_data_dirty,
+  malaria_data_dirty[sample(1:n, 20), ]
+)
+
+head(malaria_data_dirty)
+
+```
+
+```{r}
+str(malaria_data_dirty)
+summary(malaria_data_dirty)
+colSums(is.na(malaria_data_dirty))
+```
+
+```{r}
+malaria_data_clean <- malaria_data_dirty %>% 
+ mutate(
+    sex = str_trim(str_to_title(sex)),
+    wealth = str_trim(str_to_title(wealth)),
+    residence = str_trim(str_to_title(residence))
+ )
+```
+
+```{r}
+malaria_data_clean %>%
+  distinct(malaria)
+
+```
+
+```{r}
+malaria_data_clean <- malaria_data_clean %>%
+  mutate(
+    sex = case_when(
+      sex %in% c("Female", "F") ~ "Female",
+      sex %in% c("Male", "M") ~ "Male",
+      TRUE ~ NA_character_
+    ),
+    wealth = case_when(
+      wealth %in% c("Middle", "Mid") ~ "Middle",
+      wealth == "Rich" ~ "Rich",
+      wealth == "Poor" ~ "Poor",
+      TRUE ~ NA_character_
+)
+  )
+```
+
+```{r}
+malaria_data_clean <- malaria_data_clean %>%
+  distinct()
+```
+
+```{r}
+ggplot(malaria_data_clean, aes(x = age)) +
+  geom_histogram(bins = 5, fill = "skyblue") +
+    labs(title = "Age Distribution")
+```
+
+```{r}
+ # replacing missing age values
+  malaria_data_clean %>%
+  filter(age < 0 | age >60)
+
+malaria_data_clean <- malaria_data_clean  %>%
+  mutate(age = if_else(age < 0 | age > 60, NA, age)) %>% 
+  filter(!is.na(age))
+
+skewness(malaria_data_clean$age, na.rm = TRUE)
+```
+
+
+```{r}
+malaria_data_clean <- malaria_data_clean  %>%
+  mutate(
+    age = coalesce(age, round(mean(age, na.rm = TRUE)), 0)
+  )
+```
+
+
+```{r}
+
+theme_who <- function() {
+  theme_minimal(base_size = 14) +
+    theme(
+      # Titles
+      plot.title = element_text(
+        hjust = 0.5,
+        size = 16,
+        face = "bold"
+      ),
+      plot.subtitle = element_text(
+        hjust = 0.5,
+        size = 14,
+        face = "bold"
+      ),
+      
+      # Axis titles
+      axis.title = element_text(face = "bold"),
+      
+      # Grid (clean look)
+      panel.grid.major = element_line(color = "grey85"),
+      panel.grid.minor = element_blank(),
+      
+      # Background
+      panel.background = element_rect(fill = "white"),
+      plot.background = element_rect(color ="black",  fill = "white"),
+      
+      # Legend
+      legend.position = "bottom",
+      legend.title = element_text(face = "bold")
+    )
+}
+
+
+ggplot(malaria_data_clean, aes(x = age)) +
+  geom_histogram(aes(y = after_stat(density)),#creates density, scaled version of count)
+                 bins = 13, 
+                 alpha = 0.6, # controls transparency of the bars
+                 fill = "skyblue", 
+                 color = "black") +
+  
+  #creating a smooth curve to show the distribution of the data, 
+   geom_density(
+               color = "darkred",
+               linewidth = 1.2
+               ) +
+  #Recomputes histogram bins, Finds count in each bin, Places text at top of bars, Displays the count values
+  stat_bin(
+    bins = 13,
+    aes(y = after_stat(density), label = after_stat(count)),
+    geom = "text",
+    vjust = -0.5,
+    size = 3
+  ) +
+ 
+  #controls the x axis labels
+  scale_x_continuous(
+    breaks = seq(0, 60, 5),
+    limits = c(0, 60)
+  ) +
+    labs(title = "Age Distribution",
+         subtitle = "Age")+
+  
+  theme_who()
+```
+
+```{r}
+ggplot(malaria_data_clean, aes(x = temperature)) +
+  geom_histogram(bins = 30, fill = "orange", colour = "black") +
+  labs(title = "Temperature Distribution")+
+  theme_who()
+```
+
+```{r}
+ #replacing outlier temperature values to NA
+malaria_data_clean %>%
+ filter(temperature < 30|temperature > 42)
+
+malaria_data_clean <- malaria_data_clean  %>%
+  mutate(
+    temperature = if_else(temperature < 30|temperature > 42, NA, temperature)
+  )
+skewness(malaria_data_clean$temperature, na.rm = TRUE)
+```
+
+```{r}
+malaria_data_clean <- malaria_data_clean  %>%
+  mutate(
+    temperature = coalesce(temperature, mean(temperature, na.rm = TRUE))
+  )
+```
+
+```{r}
+#univariate analysis
+
+ggplot(malaria_data_clean, aes(x = distance_health_facility)) +
+  geom_histogram(bins = 30, fill = "green", colour = "black") 
+  labs(title = "Distance of the health facility")+
+  theme_who()
+
+```
+
+```{r}
+
+```
+
+```{r}
+ # replacing missing sex values
+malaria_data_clean <- malaria_data_clean  %>%
+  mutate(
+    sex= if_else(is.na(sex), "Unknown", sex)
+  )
+```
+
+```{r}
+  #replacing missing residence values
+mode_residence <- malaria_data_clean %>% 
+  count(residence) %>% 
+  arrange(desc(n)) %>% 
+  slice(1) %>% 
+  pull(residence)
+
+malaria_data_clean <- malaria_data_clean  %>%
+  mutate(residence = if_else(is.na(residence), mode_residence, residence))
+```
+
+```{r}
+#replacing missing wealth values
+mode_wealth <- malaria_data_clean %>%
+  count(wealth) %>% 
+  arrange(desc(wealth)) %>% 
+  slice(1) %>% 
+  pull(wealth)
+
+malaria_data_clean <- malaria_data_clean  %>%
+  mutate(wealth = if_else(is.na(wealth), mode_wealth, wealth))
+```
+
+```{r}
+#replacing missing distance values
+median_value <- median(malaria_data_clean$distance_health_facility, na.rm = TRUE)
+
+malaria_data_clean <- malaria_data_clean %>%
+  mutate(distance_health_facility = if_else(
+    is.na(distance_health_facility),
+    median_value,
+    distance_health_facility
+  ))
+```
+
+```{r}
+#replacing missing in pregnacy
+malaria_data_clean <- malaria_data_clean %>%
+  mutate(
+    pregnant = as.character(pregnant),
+    pregnant = if_else(is.na(pregnant), "Unknown", pregnant)
+    )
+```
+
+```{r} 
+#replacing NA malaria values
+# malaria_data_clean <- malaria_data_clean %>%
+#   mutate(
+#     malaria = if_else(is.na(malaria), NA, malaria)
+#   )
+```
+
+```{r}
+
+```
+
+```{r}
+malaria_data_clean <- malaria_data_clean %>%
+  mutate(
+    pregnant = case_when(
+      pregnant == "1" ~ "Yes",
+      pregnant == "0" ~ "No",
+      TRUE ~ "Unknown"
+    ),
+    pregnant = as.factor(pregnant)
+  )
+```
+
+```{r}
+#handling malaria missing values
+malaria_data_clean <- malaria_data_clean %>%
+  filter(!is.na(malaria))
+
+malaria_data_clean <- malaria_data_clean %>%
+  mutate(malaria = factor(malaria,
+                          levels = c(0, 1),
+                          labels = c("Negative", "Positive")))
+```
+
+```{r}
+malaria_data_clean <- malaria_data_clean %>%
+  mutate(
+    sex = as.factor(sex),
+    wealth = as.factor(wealth),
+    residence = as.factor(residence)
+  )
+str(malaria_data_clean)
+```
+
+```{r}
+binary_vars <- c("fever", "headache", "vomiting", "fatigue",
+                 "bednet", "stagnant_water", "sprayed_house",
+                 "recent_travel", "previous_malaria", "under5")
+
+malaria_data_clean <- malaria_data_clean %>%
+  mutate(across(all_of(binary_vars), ~ factor(
+    ifelse(.x == 1, "Yes",
+           ifelse(.x == 0, "No", NA)),
+    levels = c("No", "Yes")
+  )))
+
+str(malaria_data_clean)
+```
+
+```{r}
+table(malaria_data_clean$malaria)
+prop.table(table(malaria_data_clean$malaria))
+```
+
+```{r}
+#It creates boxplots to compare age, temperature, and distance to a health facility between malaria-positive and malaria-negative individuals.
+
+long_data <- malaria_data_clean %>%
+  pivot_longer(
+    cols = c(age, temperature, distance_health_facility),
+    names_to = "variable",
+    values_to = "value"
+  )
+ggplot(long_data, aes(x = malaria, y = value, fill = malaria)) +
+  geom_boxplot() +
+  facet_wrap(~ variable, scales = "free_y") +
+  labs(
+    title = "Numeric variables by Malaria status",
+    x = "Malaria status",
+    y = "Value"
+  ) +
+  theme_who()
+```
+
+
+```{r}
+#categorical variables analysis
+table(malaria_data_clean$sex, malaria_data_clean$malaria)
+
+table(malaria_data_clean$wealth, malaria_data_clean$malaria)
+
+table(malaria_data_clean$residence, malaria_data_clean$malaria)
+```
+
+
+```{r}
+table(malaria_data_clean$fever, malaria_data_clean$malaria)
+prop.table(table(malaria_data_clean$fever, malaria_data_clean$malaria), 1)
+
+table(malaria_data_clean$headache, malaria_data_clean$malaria)
+prop.table(table(malaria_data_clean$headache, malaria_data_clean$malaria), 1)
+
+table(malaria_data_clean$fatigue, malaria_data_clean$malaria)
+prop.table(table(malaria_data_clean$fatigue, malaria_data_clean$malaria), 1)
+
+
+table(malaria_data_clean$stagnant_water, malaria_data_clean$malaria)
+prop.table(table(malaria_data_clean$stagnant_water, malaria_data_clean$malaria), 1)
+
+```
+
+
+
+```{r}
+#visual comparison between symptoms and malaria status
+pivot_longer_data <- malaria_data_clean %>%
+  select(fever, headache, fatigue, stagnant_water, bednet, sprayed_house, malaria) %>%
+  pivot_longer(cols = -malaria, names_to = "symptom", values_to = "value") %>%
+  
+  mutate(symptom = factor(symptom,
+                        levels = c("fever", "headache", "fatigue",
+                                   "stagnant_water", "bednet", "sprayed_house")))
+  
+  ggplot(pivot_longer_data, aes(x = value, fill = malaria)) +
+  geom_bar(position = "fill") +
+  facet_wrap(~ symptom) +
+  labs(title = "Symptoms vs Malaria",
+       y = "Proportion",
+       x = "Symptom Presence") +
+  scale_y_continuous(labels = scales::percent)+
+  theme_set(theme_who())
+```
+
+```{r}
+#creating a table doing a chi-square test, calculating the strength using cramer's V and storing them in a table 
+symptoms <- c("fever", "headache", "fatigue", 
+              "stagnant_water", "bednet", "sprayed_house")
+
+results <- lapply(symptoms, function(var) {
+  
+  tab <- table(malaria_data_clean[[var]],
+               malaria_data_clean$malaria,
+               useNA = "no")
+  
+  test <- chisq.test(tab)
+  
+  
+  data.frame(
+    symptom = var,
+    p_value = test$p.value,
+    significant = ifelse(test$p.value < 0.05, "Yes", "No"),
+    cramers_v = cramerV(tab)
+  )
+})
+
+results_df <- do.call(rbind, results)
+
+results_df <- results_df %>%
+  mutate(
+    strength = case_when(
+      cramers_v < 0.1 ~ "Very weak",
+      cramers_v < 0.3 ~ "Weak",
+      cramers_v < 0.5 ~ "Moderate",
+      TRUE ~ "Strong"
+    )
+  )
+results_df
+
+# results <- lapply(symptoms, function(var) {
+#   tab <- table(malaria_data_clean[[var]], malaria_data_clean$malaria)
+#   test <- chisq.test(tab)
+#   
+#   data.frame(
+#     symptom = var,
+#     p_value = test$p.value,
+#     cramers_v = cramerV(tab)
+#   )
+# })
+
+```
+
+```{r}
+#checks whether age, temperature, and distance to a health facility differ between malaria-positive and malaria-negative individuals using the Wilcoxon test.
+
+numeric_vars <- c("age", "temperature", "distance_health_facility")
+
+lapply(numeric_vars, function(var) {
+  
+  formula <- as.formula(paste(var, "~ malaria"))
+  
+  test <- wilcox.test(formula, data = malaria_data_clean)
+  
+  data.frame(
+    variable = var,
+    p_value = test$p.value,
+    significant = ifelse(test$p.value < 0.05, "Yes", "No")
+  )
+}) %>% bind_rows()
+```
+
+```{r}
+
+```
+
+```{r}
+#checking multicollinearityy for symptoms
+symptom_model <- glm(malaria ~ fever + headache + fatigue + vomiting,
+                     data = malaria_data_clean,
+                     family = binomial)
+
+vif(symptom_model)
+```
+
+```{r}
+#checking multicollinearityy for FEVER AND TEMPERATURE
+fever_temp_model <- glm(malaria ~ fever + temperature,
+                        data = malaria_data_clean,
+                        family = binomial)
+
+vif(fever_temp_model)
+```
+
+```{r}
+#CHECKING FOR MULTICOLLINEARITY for environmental factors
+env_model <- glm(malaria ~ bednet + sprayed_house + stagnant_water,
+                 data = malaria_data_clean,
+                 family = binomial)
+
+vif(env_model)
+```
+```{r}
+#checking for multicollinearity for age and under 5
+demo_model <- glm(malaria ~ age + under5,
+                  data = malaria_data_clean,
+                  family = binomial)
+
+vif(demo_model)
+```
+
+```{r}
+#logistic regression model
+final_model <- glm(malaria ~ age + temperature +
+                     headache + fatigue + stagnant_water + bednet + sprayed_house,
+                   data = malaria_data_clean,
+                   family = binomial)
+
+summary(final_model)
+
+exp(coef(final_model))
+
+exp(confint(final_model))
+
+vif(final_model)
+```
+
+```{r}
+#evaluating prediction ability of the model
+pred_probs <- predict(final_model, type = "response")
+
+pred_class <- factor(ifelse(predict(final_model, type = "response") > 0.5, 1, 0),
+                     levels = c(0, 1),
+                     labels = c("Negative", "Positive"))
+
+table(Predicted = pred_class, Actual = malaria_data_clean$malaria)
+```
+                                                                                                
